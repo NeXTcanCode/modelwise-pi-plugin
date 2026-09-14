@@ -1,0 +1,29 @@
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+type Registry = ExtensionContext["modelRegistry"];
+type Model = ReturnType<Registry["getAvailable"]>[number];
+type Context = Parameters<Registry["complete"]>[1];
+type AssistantMessage = Awaited<ReturnType<Registry["complete"]>>;
+type Usage = AssistantMessage["usage"];
+export type InvestigationResult = {
+  worker: string;
+  files: string[];
+  summary?: string;
+  direct?: boolean;
+  reason?: string;
+  partial?: boolean;
+  format?: string;
+};
+export function repositoryInventory(cwd: string, signal?: AbortSignal): Promise<string[]>;
+export function investigate(options: {
+  cwd: string;
+  question: string;
+  pool: Model[];
+  primaryCost?: Model["cost"];
+  signal?: AbortSignal;
+  complete: (model: Model, context: Context, options: { signal?: AbortSignal; maxTokens: number }) => Promise<AssistantMessage>;
+  onUsage?: (usage: Usage, model: Model) => void;
+  onWorker?: (model: Model) => void;
+  onTiming?: (model: Model, ms: number) => void;
+  timings?: Record<string, number>;
+  inventory?: typeof repositoryInventory;
+}): Promise<InvestigationResult>;
