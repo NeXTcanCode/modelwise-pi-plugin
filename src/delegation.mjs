@@ -40,6 +40,25 @@ export function estimateTokens(text) {
   return Math.ceil(String(text || "").length / 4);
 }
 
+// ponytail: skip worker when prompt+repo both small; raise limits if big repos get false skips
+export const DELEGATION_THRESHOLD = {
+  maxPromptChars: 250,
+  maxMentionedFiles: 1,
+  maxRepoFiles: 20,
+};
+
+export function shouldDelegateInvestigation({ question, repoFileCount }) {
+  const broadPrompt = question.length > DELEGATION_THRESHOLD.maxPromptChars
+    || countMentionedFiles(question) > DELEGATION_THRESHOLD.maxMentionedFiles;
+  const largeRepo = repoFileCount > DELEGATION_THRESHOLD.maxRepoFiles;
+  return broadPrompt || largeRepo;
+}
+
+export function explainDelegationSkip({ question, repoFileCount }) {
+  const mentions = countMentionedFiles(question);
+  return `below delegation threshold (prompt ${question.length} chars, ${mentions} file mention(s), ${repoFileCount} repo files); primary will answer directly`;
+}
+
 export function heuristicComplexity({ question, files }) {
   const totalBytes = files.reduce((sum, file) => sum + file.text.length, 0);
   const estTokens = estimateTokens(question) + files.reduce((sum, file) => sum + estimateTokens(file.text), 0);

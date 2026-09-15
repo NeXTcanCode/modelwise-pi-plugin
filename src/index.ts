@@ -142,9 +142,12 @@ export default function (pi: ExtensionAPI) {
         },
       });
       if (result.direct) {
-        outcome = "direct";
-        workerStatus = `Worker: ${result.worker} — direct (not a failure): ${result.reason}`;
-        if (ctx.hasUI) ctx.ui.notify(`Modelwise: direct — ${result.reason}`, "info");
+        outcome = result.skipThreshold ? "skipped" : "direct";
+        activeWorker = result.worker ?? "none";
+        workerStatus = result.skipThreshold
+          ? `Threshold: ${result.reason}`
+          : `Worker: ${result.worker} — direct (not a failure): ${result.reason}`;
+        if (ctx.hasUI) ctx.ui.notify(result.skipThreshold ? `Modelwise: ${result.reason}` : `Modelwise: direct — ${result.reason}`, "info");
         return;
       }
       if (result.partial) stats.timeouts++;
