@@ -27,4 +27,6 @@ export function investigate(options: {
   onTiming?: (model: Model, ms: number) => void;
   timings?: Record<string, number>;
   inventory?: typeof repositoryInventory;
+  memory?: { fresh(path: string, text: string): Promise<{ summary: string } | undefined>; set(path: string, text: string, summary: string): Promise<void>; save(): Promise<void> } | null;
+  onMemoryHit?: (path: string, chars: number) => void;
 }): Promise<InvestigationResult>;

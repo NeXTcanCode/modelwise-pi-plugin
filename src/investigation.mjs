@@ -16,7 +16,11 @@ export async function repositoryInventory(cwd, signal) {
   return paths.slice(0, 2000);
 }
 
-export async function investigate({ cwd, question, pool, primaryCost, complete, signal, onUsage = () => {}, inventory = repositoryInventory, timings = {}, onTiming = () => {}, onWorker = () => {} }) {
+const INTROVERT_SYSTEM = `
+Introvert mode: keep the handoff as short as possible while preserving every fact the primary needs (paths, line refs, exact identifiers, uncertainties). No filler. Some files are supplied as cached summaries of unchanged code instead of source; trust them and cite the path.
+Return strict JSON {"summary":"...","memory":{"<path>":"one-line purpose + exports/signatures + key dependencies"}} with a memory entry for every FILE supplied as full source.`;
+
+export async function investigate({ cwd, question, pool, primaryCost, complete, signal, onUsage = () => {}, inventory = repositoryInventory, timings = {}, onTiming = () => {}, onWorker = () => {}, memory = null, onMemoryHit = () => {} }) {
   if (signal?.aborted) throw new Error("Investigation cancelled.");
   const paths = await inventory(cwd, signal);
   if (!paths.length) throw new Error("No repository files found.");
@@ -28,15 +32,24 @@ export async function investigate({ cwd, question, pool, primaryCost, complete, 
   const ranked = [...paths].sort((a, b) => score(b) - score(a) || a.localeCompare(b));
   const evidence = [];
   const read = new Set();
+  const fresh = new Map(); // path -> full text read this turn (memory candidates)
   let bytes = 0;
   for (const path of ranked.slice(0, 12)) {
     signal?.throwIfAborted();
     if (read.size >= 6 || bytes >= 24000) break;
     try {
       const [file] = await collectFiles(cwd, [path]);
+      const cached = memory && await memory.fresh(path, file.text);
+      if (cached) {
+        read.add(path);
+        onMemoryHit(path, file.text.length);
+        evidence.push(`CACHED SUMMARY ${path} (unchanged since last read)\n${cached.summary}\nEND SUMMARY`);
+        continue;
+      }
       const excerpt = file.text.slice(0, Math.min(6000, 24000 - bytes));
       bytes += excerpt.length;
       read.add(path);
+      fresh.set(path, file.text);
       evidence.push(`FILE ${path}\n${excerpt.split("\n").map((line, i) => `${i + 1}: ${line}`).join("\n")}\n${excerpt.length < file.text.length ? "[TRUNCATED: remaining source not supplied]" : ""}\nEND FILE`);
     } catch { /* Skip disallowed, binary, oversized or missing files. */ }
   }
@@ -47,6 +60,12 @@ export async function investigate({ cwd, question, pool, primaryCost, complete, 
   // rejecting a specific model id). Once that happens, exclude it and retry
   // with the next-best candidate rather than aborting investigation entirely.
   const brokenWorkers = new Set();
+  const remember = async (map) => {
+    if (!memory) return;
+    // Only store entries for files whose full text is unchanged and was read whole.
+    if (map && typeof map === "object") for (const [path, summary] of Object.entries(map)) if (fresh.has(path) && typeof summary === "string" && summary.trim()) await memory.set(path, fresh.get(path), summary);
+    await memory.save();
+  };
   const partial = () => ({ partial: true, summary: `Worker timed out. No completed model analysis is available. These locally selected excerpts may help targeted investigation; selection was based on filename relevance and can miss affected code.\n\n${evidence.join("\n\n")}`, files: [...read], worker: `${worker.provider}/${worker.id}` });
   for (let round = 0; round < 1; round++) {
     signal?.throwIfAborted();
@@ -64,7 +83,7 @@ export async function investigate({ cwd, question, pool, primaryCost, complete, 
       const started = Date.now();
       onWorker(worker);
       try {
-        response = await complete(worker, { systemPrompt: SYSTEM, messages }, { signal, maxTokens: 900 });
+        response = await complete(worker, { systemPrompt: memory ? SYSTEM + INTROVERT_SYSTEM : SYSTEM, messages }, { signal, maxTokens: 900 });
       } catch (error) {
         if (signal?.aborted && signal.reason?.name === "TimeoutError") return partial();
         throw error;
@@ -96,6 +115,7 @@ export async function investigate({ cwd, question, pool, primaryCost, complete, 
       return { direct: true, reason: action.reason.slice(0, 300), files: [...read], worker: `${worker.provider}/${worker.id}` };
     }
     if (typeof action.summary === "string" && action.summary.trim()) {
+      await remember(action.memory);
       return { summary: action.summary.slice(0, 12000), files: [...read], worker: `${worker.provider}/${worker.id}` };
     }
     throw new Error(`${worker.provider}/${worker.id}: no summary or direct decision in response (stopReason=${response.stopReason ?? "unknown"}); single-call budget ended.`);

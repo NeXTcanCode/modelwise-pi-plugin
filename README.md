@@ -44,6 +44,17 @@ Your primary remains responsible for the final work. If delegation is unavailabl
 | `/modelwise setup`              | Optionally choose which worker models may be used. |
 | `/modelwise status`             | Show configuration and session statistics.         |
 | `/modelwise handoff`            | Inspect the latest available worker handoff.       |
+| `/modelwise introvert [on\|off\|light\|normal\|aggressive\|memory\|forget]` | Cut input and output tokens (see below). Bare = status. |
+
+### Introvert
+
+Runs on top of Modelwise (Modelwise must be on). It lowers cost on both sides of the primary model:
+
+- **Codebase memory** — files the worker has read are summarized into `~/.modelwise/introvert/<project>.json` (summary and structure only, never source). Unchanged files (matched by content hash) are served from memory instead of being re-read; changed files are re-summarized.
+- **History compression** — once conversation history passes ~8k tokens, the cheapest eligible model condenses older turns. The last 3 user turns stay verbatim and the summary is frozen so the prompt prefix stays stable.
+- **Terse output** — a brevity rule is added to the primary's system prompt (this is what actually reduces output tokens), and a light filter strips filler openers/sign-offs from replies. Code, errors, warnings and questions are never filtered. `aggressive` falls back to `normal` on complex tasks.
+
+The status widget shows estimated tokens saved. Estimates, not billing data. The primary can still read exact code with its normal tools or `modelwise_read`.
 
 Every task discovers currently available text models. Added models become eligible automatically and removed models are no longer considered. Setup saves only explicit exclusions, including exclusions for temporarily unavailable models. Older saved worker snapshots migrate to no exclusions because their omissions cannot be distinguished from models added later; reapply any intended exclusions in setup.
 
