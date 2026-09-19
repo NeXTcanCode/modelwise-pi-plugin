@@ -14,7 +14,7 @@ Requirements:
 Install the package:
 
 ```bash
-pi install npm:modelwise-pi
+pi install npm:@nextuplodsonnpm/modelwise-pi
 ```
 
 Start Pi from your project directory. The installed extension loads automatically:
@@ -70,7 +70,7 @@ The worker is read-only. Investigation is bounded and may miss relevant code, so
 ## Updating
 
 ```bash
-pi update npm:modelwise-pi
+pi update npm:@nextuplodsonnpm/modelwise-pi
 ```
 
 Restart Pi with the extension to load the update.
