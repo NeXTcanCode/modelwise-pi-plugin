@@ -46,7 +46,7 @@ Your primary remains responsible for the final work. If delegation is unavailabl
 | `/modelwise setup`              | Optionally choose which worker models may be used. |
 | `/modelwise status`             | Show configuration and session statistics.         |
 | `/modelwise handoff`            | Inspect the latest available worker handoff.       |
-| `/modelwise introvert [on\|off\|light\|normal\|aggressive\|memory\|forget]` | Cut input and output tokens (see below). Bare = status. |
+| `/modelwise introvert` | Cut input and output tokens. See [Introvert](#introvert) for all options. |
 
 ### Introvert
 
@@ -55,6 +55,34 @@ Runs on top of Modelwise (Modelwise must be on). It lowers cost on both sides of
 - **Codebase memory** — files the worker has read are summarized into `~/.modelwise/introvert/<project>.json` (summary and structure only, never source). Unchanged files (matched by content hash) are served from memory instead of being re-read; changed files are re-summarized.
 - **History compression** — once conversation history passes ~8k tokens, older turns are condensed to what matters. The last 3 user turns stay verbatim and the summary is frozen so the prompt prefix stays stable.
 - **Terse output** — a brevity rule is added to the primary's system prompt (this is what actually reduces output tokens), and a light filter strips filler openers/sign-offs from replies. Code, errors, warnings and questions are never filtered. `aggressive` falls back to `normal` on complex tasks.
+
+#### Introvert commands
+
+| Command | What it does |
+| --- | --- |
+| `/modelwise introvert` | Show whether Introvert is on, the current level, and estimated tokens saved. |
+| `/modelwise introvert on` | Turn Introvert on, keeping your saved level (default `normal`). |
+| `/modelwise introvert off` | Turn Introvert off. Your level is remembered for next time. |
+| `/modelwise introvert light` \| `normal` \| `aggressive` | Set the level and turn Introvert on in one step. |
+| `/modelwise introvert memory` | List what Introvert remembers about the current project (file paths and their summaries). This only lists; it does not turn anything on or off. |
+| `/modelwise introvert forget` | Clear the remembered files for the current project. |
+| `/modelwise introvert forget all` | Clear remembered files for every project. |
+
+Codebase memory and history trimming work automatically whenever Introvert is on; there is no separate switch for them. Forgetting memory is always safe: the next task simply re-reads files and rebuilds it.
+
+#### Levels
+
+The level controls how brief the primary model's replies are. It does not change codebase memory or history trimming, which behave the same at every level.
+
+| Level | Reply style | Best for | Trade-off |
+| --- | --- | --- | --- |
+| `light` | Drops greetings, preambles and restating your question. Explanations stay, but short. | Learning a codebase, reviews, or anything where you want the reasoning. | Smallest savings on output. |
+| `normal` (default) | No greetings, recap or sign-off. Gives results and actions; explains only when the reason isn't obvious. | Everyday coding work. | Balanced: good savings, still readable. |
+| `aggressive` | Minimum words: actions, code or diffs, and results as terse bullets. No explanation unless you ask. | Routine, well-defined edits where you only need the outcome. | Largest savings, but you get little context. Ask a follow-up if you need the why. |
+
+In every level, errors, warnings and questions the model needs answered are kept. `aggressive` automatically drops to `normal` on tasks that look complex, so hard problems don't lose useful detail.
+
+Example: `/modelwise introvert aggressive` turns Introvert on and sets the level. Later, `/modelwise introvert off` disables it; running `/modelwise introvert on` again brings back `aggressive`.
 
 The status widget shows estimated tokens saved. Estimates, not billing data. The primary can still read exact code with its normal tools or `modelwise_read`.
 
