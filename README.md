@@ -4,6 +4,8 @@ Modelwise helps your selected Pi model focus on implementation by delegating an 
 
 The worker provides findings and relevant source locations. Your selected primary model stays in place to verify the findings, make changes, and run tests.
 
+**Introvert** (`/modelwise introvert`) builds on Modelwise to cut token usage on both sides of your primary model. It remembers what it has already learned about your codebase so files aren't re-read every turn, trims older conversation history to what matters, and keeps the primary's replies short and to the point. The result is a lower LLM bill with the same quality of work.
+
 ## Installation
 
 Requirements:
@@ -51,7 +53,7 @@ Your primary remains responsible for the final work. If delegation is unavailabl
 Runs on top of Modelwise (Modelwise must be on). It lowers cost on both sides of the primary model:
 
 - **Codebase memory** — files the worker has read are summarized into `~/.modelwise/introvert/<project>.json` (summary and structure only, never source). Unchanged files (matched by content hash) are served from memory instead of being re-read; changed files are re-summarized.
-- **History compression** — once conversation history passes ~8k tokens, the cheapest eligible model condenses older turns. The last 3 user turns stay verbatim and the summary is frozen so the prompt prefix stays stable.
+- **History compression** — once conversation history passes ~8k tokens, older turns are condensed to what matters. The last 3 user turns stay verbatim and the summary is frozen so the prompt prefix stays stable.
 - **Terse output** — a brevity rule is added to the primary's system prompt (this is what actually reduces output tokens), and a light filter strips filler openers/sign-offs from replies. Code, errors, warnings and questions are never filtered. `aggressive` falls back to `normal` on complex tasks.
 
 The status widget shows estimated tokens saved. Estimates, not billing data. The primary can still read exact code with its normal tools or `modelwise_read`.
@@ -74,7 +76,7 @@ These figures are not total task cost or guaranteed savings. The primary's subse
 
 ## Data and limitations
 
-Your prompt and selected repository content are sent to the worker through your configured Pi provider. Its findings are supplied to the primary and may be retained in Pi's session history. Only enable delegation for content you are permitted to share with those providers.
+Your prompt and selected repository content are sent to the worker through your configured Pi provider. With Introvert on, older conversation turns and file summaries are also processed through that same provider. Its findings are supplied to the primary and may be retained in Pi's session history. Only enable delegation for content you are permitted to share with those providers.
 
 The worker is read-only. Investigation is bounded and may miss relevant code, so the primary must verify its findings. File protections are not comprehensive secret detection. Provider limits, latency, and charges still apply.
 

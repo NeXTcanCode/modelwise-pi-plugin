@@ -1,6 +1,6 @@
 {
   "name": "@nextuplodsonnpm/modelwise-pi",
-  "version": "0.1.54",
+  "version": "0.1.541",
   "license": "MIT",
   "description": "Automatic repository investigation with cheaper worker models for Pi",
   "keywords": [

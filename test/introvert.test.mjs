@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createMemory } from "../src/introvert/memory.mjs";
+import { mkdir, writeFile, utimes, readdir } from "node:fs/promises";
+import { createMemory, pruneIdleProjects, forgetAllProjects } from "../src/introvert/memory.mjs";
 import { filterReply, effectiveLevel } from "../src/introvert/output.mjs";
 import { compressHistory } from "../src/introvert/compress.mjs";
 
@@ -53,4 +54,36 @@ test("history compresses past threshold, keeps recent turns, and freezes the sum
 test("small history is left alone", async () => {
   const r = await compressHistory(turns(2), {}, { summarize: async () => "s" });
   assert.equal(r.saved, 0);
+});
+
+test("pruneMissing drops entries for deleted files only", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "iv-cwd-"));
+  await writeFile(join(cwd, "keep.js"), "k");
+  const mem = createMemory(await mkdtemp(join(tmpdir(), "iv-")), cwd);
+  await mem.set("keep.js", "k", "kept");
+  await mem.set("gone.js", "g", "gone");
+  assert.equal(await mem.pruneMissing(), 1);
+  assert.ok(await mem.fresh("keep.js", "k"));
+  assert.equal(await mem.entry("gone.js"), undefined);
+});
+
+test("fresh hit refreshes last-used time", async () => {
+  const mem = createMemory(await mkdtemp(join(tmpdir(), "iv-")), "/repo");
+  await mem.set("a.js", "v", "s");
+  const e = await mem.entry("a.js");
+  e.used = 1;
+  await mem.fresh("a.js", "v");
+  assert.ok((await mem.entry("a.js")).used > 1);
+});
+
+test("idle project files are deleted after 30 days, recent ones kept; forget all clears dir", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "iv-dir-"));
+  await writeFile(join(dir, "old.json"), "{}");
+  await writeFile(join(dir, "new.json"), "{}");
+  const old = new Date(Date.now() - 40 * 86400000);
+  await utimes(join(dir, "old.json"), old, old);
+  assert.equal(await pruneIdleProjects(dir), 1);
+  assert.deepEqual(await readdir(dir), ["new.json"]);
+  await forgetAllProjects(dir);
+  assert.deepEqual(await readdir(dir).catch(() => []), []);
 });
