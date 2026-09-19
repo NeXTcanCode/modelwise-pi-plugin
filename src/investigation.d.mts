@@ -9,6 +9,7 @@ export type InvestigationResult = {
   files: string[];
   summary?: string;
   direct?: boolean;
+  skipThreshold?: boolean;
   reason?: string;
   partial?: boolean;
   format?: string;
