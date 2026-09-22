@@ -1,5 +1,18 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
+
+// ripgrep may not be on the worker process PATH. Prefer the absolutely-located
+// binary bundled by @vscode/ripgrep when present; fall back to PATH `rg`.
+const require = createRequire(import.meta.url);
+function resolveRg() {
+  try {
+    const rgPath = require("@vscode/ripgrep").rgPath;
+    if (existsSync(rgPath)) return rgPath;
+  } catch { /* not installed */ }
+  return "rg";
+}
 import { collectFiles, validatePaths, estimateTokens, pickWorker, explainPickFailure, textFromResponse, shouldDelegateInvestigation, explainDelegationSkip } from "./delegation.mjs";
 
 const exec = promisify(execFile);
@@ -9,16 +22,19 @@ Investigate using the supplied locally selected source excerpts. This is your on
 When ready, return a concise plain-text handoff (JSON {"summary":"..."} is also accepted). Summarize findings, affected files with line references, suggested changes, relevant tests, and uncertainties. Never claim you edited or tested anything. Do not invent evidence. The primary model will implement the task.`;
 
 export async function repositoryInventory(cwd, signal) {
-  const { stdout } = await exec("rg", ["--files", "--hidden", "-g", "!.git", "-g", "!node_modules", "-g", "!.env*", "-g", "!*.pem", "-g", "!*.key", "-g", "!*.p12", "-g", "!*.pfx"], { cwd, signal, timeout: 10000, maxBuffer: 2 * 1024 * 1024 });
+  const { stdout } = await exec(resolveRg(), ["--files", "--hidden", "-g", "!.git", "-g", "!node_modules", "-g", "!.env*", "-g", "!*.pem", "-g", "!*.key", "-g", "!*.p12", "-g", "!*.pfx"], { cwd, signal, timeout: 10000, maxBuffer: 2 * 1024 * 1024 });
   const paths = stdout.split("\n").filter(Boolean).filter((path) => {
     try { validatePaths(cwd, [path]); return true; } catch { return false; }
   });
   return paths.slice(0, 2000);
 }
 
-const INTROVERT_SYSTEM = `
-Introvert mode: keep the handoff as short as possible while preserving every fact the primary needs (paths, line refs, exact identifiers, uncertainties). No filler. Some files are supplied as cached summaries of unchanged code instead of source; trust them and cite the path.
-Return strict JSON {"summary":"...","memory":{"<path>":"one-line purpose + exports/signatures + key dependencies"}} with a memory entry for every FILE supplied as full source.`;
+// Keep only the handoff lines that mention a file, so a later investigation can
+// reuse them in place of that file's excerpt while its content is unchanged.
+function fileNotes(summary, path) {
+  const lines = summary.split("\n").filter((line) => line.includes(path));
+  return lines.join("\n").trim();
+}
 
 export async function investigate({ cwd, question, pool, primaryCost, complete, signal, onUsage = () => {}, inventory = repositoryInventory, timings = {}, onTiming = () => {}, onWorker = () => {}, memory = null, onMemoryHit = () => {} }) {
   if (signal?.aborted) throw new Error("Investigation cancelled.");
@@ -32,24 +48,26 @@ export async function investigate({ cwd, question, pool, primaryCost, complete, 
   const ranked = [...paths].sort((a, b) => score(b) - score(a) || a.localeCompare(b));
   const evidence = [];
   const read = new Set();
-  const fresh = new Map(); // path -> full text read this turn (memory candidates)
+  const fresh = new Map();
   let bytes = 0;
   for (const path of ranked.slice(0, 12)) {
     signal?.throwIfAborted();
     if (read.size >= 6 || bytes >= 24000) break;
     try {
       const [file] = await collectFiles(cwd, [path]);
-      const cached = memory && await memory.fresh(path, file.text);
-      if (cached) {
+      const cached = memory ? await memory.fresh(path, file.text).catch(() => undefined) : undefined;
+      if (cached?.summary) {
+        const full = Math.min(6000, 24000 - bytes);
+        bytes += cached.summary.length;
         read.add(path);
-        onMemoryHit(path, file.text.length);
-        evidence.push(`CACHED SUMMARY ${path} (unchanged since last read)\n${cached.summary}\nEND SUMMARY`);
+        onMemoryHit(path, Math.max(0, Math.min(full, file.text.length) - cached.summary.length));
+        evidence.push(`CACHED NOTES ${path} (from an earlier investigation; file unchanged since)\n${cached.summary}\nEND NOTES`);
         continue;
       }
+      fresh.set(path, file.text);
       const excerpt = file.text.slice(0, Math.min(6000, 24000 - bytes));
       bytes += excerpt.length;
       read.add(path);
-      fresh.set(path, file.text);
       evidence.push(`FILE ${path}\n${excerpt.split("\n").map((line, i) => `${i + 1}: ${line}`).join("\n")}\n${excerpt.length < file.text.length ? "[TRUNCATED: remaining source not supplied]" : ""}\nEND FILE`);
     } catch { /* Skip disallowed, binary, oversized or missing files. */ }
   }
@@ -60,11 +78,16 @@ export async function investigate({ cwd, question, pool, primaryCost, complete, 
   // rejecting a specific model id). Once that happens, exclude it and retry
   // with the next-best candidate rather than aborting investigation entirely.
   const brokenWorkers = new Set();
-  const remember = async (map) => {
+  // Cache failures must never fail an investigation.
+  const remember = async (summary) => {
     if (!memory) return;
-    // Only store entries for files whose full text is unchanged and was read whole.
-    if (map && typeof map === "object") for (const [path, summary] of Object.entries(map)) if (fresh.has(path) && typeof summary === "string" && summary.trim()) await memory.set(path, fresh.get(path), summary);
-    await memory.save();
+    try {
+      for (const [path, text] of fresh) {
+        const notes = fileNotes(summary, path);
+        if (notes) await memory.set(path, text, notes);
+      }
+      await memory.save();
+    } catch { /* ignore cache write errors */ }
   };
   const partial = () => ({ partial: true, summary: `Worker timed out. No completed model analysis is available. These locally selected excerpts may help targeted investigation; selection was based on filename relevance and can miss affected code.\n\n${evidence.join("\n\n")}`, files: [...read], worker: `${worker.provider}/${worker.id}` });
   for (let round = 0; round < 1; round++) {
@@ -83,7 +106,7 @@ export async function investigate({ cwd, question, pool, primaryCost, complete, 
       const started = Date.now();
       onWorker(worker);
       try {
-        response = await complete(worker, { systemPrompt: memory ? SYSTEM + INTROVERT_SYSTEM : SYSTEM, messages }, { signal, maxTokens: 900 });
+        response = await complete(worker, { systemPrompt: SYSTEM, messages }, { signal, maxTokens: 900 });
       } catch (error) {
         if (signal?.aborted && signal.reason?.name === "TimeoutError") return partial();
         throw error;
@@ -106,6 +129,7 @@ export async function investigate({ cwd, question, pool, primaryCost, complete, 
     try { action = JSON.parse(raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")); }
     catch {
       if (response.stopReason === "stop" && raw && !/^[\s]*[\[{]/.test(raw) && !/^```json\b/i.test(raw)) {
+        await remember(raw);
         return { summary: raw.slice(0, 12000), files: [...read], worker: `${worker.provider}/${worker.id}`, format: "text" };
       }
       throw new Error(`${worker.provider}/${worker.id}: ${response.stopReason === "length" ? "output token limit reached before a complete JSON handoff" : raw ? "invalid JSON handoff" : "no text handoff returned"} (stopReason=${response.stopReason ?? "unknown"}, output tokens=${response.usage?.output ?? "unknown"}).`);
@@ -115,7 +139,7 @@ export async function investigate({ cwd, question, pool, primaryCost, complete, 
       return { direct: true, reason: action.reason.slice(0, 300), files: [...read], worker: `${worker.provider}/${worker.id}` };
     }
     if (typeof action.summary === "string" && action.summary.trim()) {
-      await remember(action.memory);
+      await remember(action.summary);
       return { summary: action.summary.slice(0, 12000), files: [...read], worker: `${worker.provider}/${worker.id}` };
     }
     throw new Error(`${worker.provider}/${worker.id}: no summary or direct decision in response (stopReason=${response.stopReason ?? "unknown"}); single-call budget ended.`);
