@@ -92,34 +92,124 @@ export function parseJudgeComplexity(raw) {
   }
 }
 
-export function pickWorker(pool, { estTokens, complexity, primaryCost, timings = {} }) {
-  if (!Array.isArray(pool) || !pool.length) return null;
-  const fitting = pool.filter((model) => model.contextWindow > estTokens * 1.3);
+export function pickWorker(pool, options) {
+  return workerTiers(pool, options).flat()[0] ?? null;
+}
+
+// Total worker calls one task may make across all tiers before giving up and
+// letting the primary model handle it.
+export const MAX_WORKER_ATTEMPTS = 6;
+// How long a worker that hit a provider-side failure (rate limit, 5xx,
+// rejected request) is skipped by later tasks in the same session.
+export const COOLDOWN_MS = 5 * 60 * 1000;
+
+const workerKey = (model) => `${model.provider}/${model.id}`;
+
+export function isCoolingDown(cooldown, model, now = Date.now()) {
+  return (cooldown?.[workerKey(model)] ?? 0) > now;
+}
+
+export function isFreeModel(model) {
+  return model?.cost?.input === 0 && model?.cost?.output === 0;
+}
+
+// Groups eligible workers into price tiers, cheapest first. Models whose
+// estimated cost for this request is equal (to ~1e-6 USD) share a tier, so a
+// failed worker hands its task to a same-price sibling before anything pricier.
+export function workerTiers(pool, { estTokens, complexity, primaryCost, timings = {}, cooldown = {}, now = Date.now() }) {
+  if (!Array.isArray(pool) || !pool.length) return [];
   const price = (cost) => estimatePrimaryCostUsd({ estInputTokens: estTokens, primaryCost: cost });
   const primaryPrice = price(primaryCost);
-  const candidates = fitting.filter((model) => {
-    const cost = price(model.cost);
-    return cost !== null && (primaryCost === undefined || (primaryPrice !== null && cost < primaryPrice));
-  });
-  const sorted = [...candidates].sort((a, b) => {
-    const priceDifference = price(a.cost) - price(b.cost);
-    if (priceDifference) return priceDifference;
+  const candidates = pool
+    .filter((model) => model.contextWindow > estTokens * 1.3 && !isCoolingDown(cooldown, model, now))
+    .map((model) => ({ model, cost: price(model.cost) }))
+    .filter(({ cost }) => cost !== null && (primaryCost === undefined || (primaryPrice !== null && cost < primaryPrice)))
+    .map((entry) => ({ ...entry, tier: Math.round(entry.cost * 1e6) }));
+  candidates.sort(({ model: a, tier: aTier }, { model: b, tier: bTier }) => {
+    if (aTier !== bTier) return aTier - bTier;
     // Reasoning is only a same-price preference, never an eligibility gate.
     if (complexity === "complex" && !!a.reasoning !== !!b.reasoning) return a.reasoning ? -1 : 1;
-    const aTime = timings[`${a.provider}/${a.id}`];
-    const bTime = timings[`${b.provider}/${b.id}`];
+    const aTime = timings[workerKey(a)];
+    const bTime = timings[workerKey(b)];
     // Unknown latency is not treated as slow. Compare only measured peers.
     return Number.isFinite(aTime) && Number.isFinite(bTime) ? aTime - bTime : 0;
   });
-  return sorted[0] || null;
+  const tiers = [];
+  let current;
+  for (const { model, tier } of candidates) {
+    if (tier !== current) { tiers.push([]); current = tier; }
+    tiers[tiers.length - 1].push(model);
+  }
+  return tiers;
+}
+
+// Thrown by a cascade attempt when that worker failed but a sibling may still
+// succeed. `partial` is any incomplete output worth passing to the next worker;
+// `transient` marks provider-side failures that put the worker on cooldown.
+export class WorkerFailure extends Error {
+  constructor(message, { partial = "", transient = false } = {}) {
+    super(message);
+    this.name = "WorkerFailure";
+    this.partial = partial;
+    this.transient = transient;
+  }
+}
+
+/**
+ * Tries workers tier by tier, sibling by sibling, until one attempt succeeds.
+ * Any error other than WorkerFailure (e.g. user cancellation) stops the cascade.
+ * @template T
+ * @param {any[][]} tiers
+ * @param {(model: any, failures: {model: any, reason: string, partial: string}[]) => Promise<T>} attempt
+ * @param {{maxAttempts?: number, signal?: AbortSignal, cooldown?: Record<string, number>, onFailure?: (model: any, error: WorkerFailure) => void}} [options]
+ * @returns {Promise<T>}
+ */
+export async function cascade(tiers, attempt, { maxAttempts = MAX_WORKER_ATTEMPTS, signal, cooldown, onFailure = () => {} } = {}) {
+  const failures = [];
+  for (const model of tiers.flat().slice(0, maxAttempts)) {
+    signal?.throwIfAborted();
+    try {
+      return await attempt(model, failures);
+    } catch (error) {
+      if (!(error instanceof WorkerFailure)) throw error;
+      failures.push({ model, reason: error.message, partial: error.partial });
+      if (error.transient && cooldown) cooldown[workerKey(model)] = Date.now() + COOLDOWN_MS;
+      onFailure(model, error);
+    }
+  }
+  const detail = failures.map(({ model, reason }) => `${workerKey(model)}: ${reason}`).join("; ");
+  throw new Error(`All ${failures.length} worker attempt(s) failed (${detail})`);
+}
+
+// Classifies a provider-level failure in a completed response. Returns null
+// when the response itself is usable and content checks are up to the caller.
+export function responseFailure(response, partial = "") {
+  const stop = response?.stopReason;
+  if (stop === "error" || stop === "aborted") {
+    return new WorkerFailure(`stopReason ${stop}: ${response.errorMessage || "no error detail from provider"}`, { transient: true });
+  }
+  if (stop === "length") {
+    return new WorkerFailure(`output token limit reached (output tokens=${response.usage?.output ?? "unknown"})`, { partial });
+  }
+  return null;
+}
+
+export function requestFailure(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return new WorkerFailure(`request failed: ${message.replace(/\s+/g, " ").slice(0, 200)}`, { transient: true });
 }
 
 // Diagnostic only, never used for routing: explains WHICH condition emptied the
 // pool, since "no worker fits" collapses several distinct causes (context size,
 // unknown pricing, nothing cheaper than primary, no reasoning-capable model) into
 // one message. Called only when pickWorker already returned null.
-export function explainPickFailure(pool, { estTokens, complexity, primaryCost }) {
+export function explainPickFailure(pool, { estTokens, complexity, primaryCost, cooldown = {} }) {
   if (!Array.isArray(pool) || !pool.length) return "worker pool is empty";
+  const cooling = pool.filter((model) => isCoolingDown(cooldown, model));
+  if (cooling.length) {
+    pool = pool.filter((model) => !cooling.includes(model));
+    if (!pool.length) return `every worker is cooling down after a recent provider failure (${cooling.map(workerKey).join(", ")})`;
+  }
   const fitting = pool.filter((model) => model.contextWindow > estTokens * 1.3);
   if (!fitting.length) return `no worker's contextWindow fits ~${Math.ceil(estTokens * 1.3)} estimated tokens (pool: ${pool.length})`;
   const price = (cost) => estimatePrimaryCostUsd({ estInputTokens: estTokens, primaryCost: cost });

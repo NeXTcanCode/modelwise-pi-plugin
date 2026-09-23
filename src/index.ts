@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { collectFiles, workerPrompt, textFromResponse, heuristicComplexity, pickWorker, explainPickFailure, estimatePrimaryCostUsd } from "./delegation.mjs";
+import { collectFiles, workerPrompt, textFromResponse, heuristicComplexity, workerTiers, explainPickFailure, estimatePrimaryCostUsd, cascade, WorkerFailure, responseFailure, requestFailure } from "./delegation.mjs";
 import { fetchCatalog, indexCatalogById, findCatalogEntry, summarizeCatalogEntry, enrichWithCatalog } from "./openrouter.mjs";
 import { investigate } from "./investigation.mjs";
 import { createCatalogCache } from "./catalog-cache.mjs";
@@ -52,6 +52,9 @@ export default function (pi: ExtensionAPI) {
   let catalogById: ReturnType<typeof indexCatalogById> | null = null;
   const cachedCatalog = createCatalogCache(join(CONFIG_DIR, "catalog.json"), fetchCatalog);
   const timings: Record<string, number> = {};
+  // Workers that recently hit provider failures (rate limits, 5xx) are skipped
+  // until their expiry so the next task starts with a healthy sibling.
+  const cooldown: Record<string, number> = {};
   let lastComparison = "";
   let workerStatus = "";
   let handoff: { id: string; content: string; primary: string; observed: boolean } | undefined;
@@ -106,18 +109,22 @@ export default function (pi: ExtensionAPI) {
   async function cheapSummarize(ctx: ExtensionContext, text: string): Promise<string | null> {
     try {
       const pool = await withCatalogFallback(liveWorkerPool(ctx.modelRegistry.getAvailable(), config.excluded, ctx.model));
-      const worker = pickWorker(pool, { estTokens: Math.ceil(text.length / 4) + 1024, complexity: "simple", primaryCost: ctx.model?.cost ?? null, timings });
-      if (!worker) return null;
-      const started = Date.now();
-      const response = await ctx.modelRegistry.complete(worker, {
-        systemPrompt: "Condense this earlier conversation for another model. Keep decisions, user constraints, file paths, identifiers, errors and open questions. Drop pleasantries and repetition. Output only the condensed text.",
-        messages: [{ role: "user", content: [{ type: "text", text }], timestamp: Date.now() }],
-      }, { maxTokens: 700 });
-      if (response.stopReason === "error" || response.stopReason === "aborted") return null;
-      recordTiming(worker, Math.max(1, Date.now() - started));
-      const cost = response.usage?.cost?.total;
-      if (Number.isFinite(cost) && cost >= 0) stats.totalCostUsd += cost;
-      return textFromResponse(response) || null;
+      const tiers = workerTiers(pool, { estTokens: Math.ceil(text.length / 4) + 1024, complexity: "simple", primaryCost: ctx.model?.cost ?? null, timings, cooldown });
+      // Compression is optional, so only a couple of siblings get a chance.
+      return await cascade(tiers, async (worker) => {
+        const started = Date.now();
+        const response = await ctx.modelRegistry.complete(worker, {
+          systemPrompt: "Condense this earlier conversation for another model. Keep decisions, user constraints, file paths, identifiers, errors and open questions. Drop pleasantries and repetition. Output only the condensed text.",
+          messages: [{ role: "user", content: [{ type: "text", text }], timestamp: Date.now() }],
+        }, { maxTokens: 700 }).catch((error) => { throw requestFailure(error); });
+        const cost = response.usage?.cost?.total;
+        if (Number.isFinite(cost) && cost >= 0) stats.totalCostUsd += cost;
+        if (response.stopReason === "error" || response.stopReason === "aborted") throw responseFailure(response);
+        recordTiming(worker, Math.max(1, Date.now() - started));
+        const condensed = textFromResponse(response);
+        if (!condensed) throw new WorkerFailure("no condensed text");
+        return condensed;
+      }, { maxAttempts: 2, cooldown });
     } catch { return null; }
   }
 
@@ -164,7 +171,7 @@ export default function (pi: ExtensionAPI) {
       stats.attempts++;
       const result = await investigate({
         cwd: ctx.cwd, question: event.prompt, pool: enrichedPool, primaryCost: ctx.model?.cost,
-        timings, onTiming: recordTiming,
+        timings, onTiming: recordTiming, cooldown,
         memory: introvertOn() ? memory : null,
         onMemoryHit: (_path, chars) => { saved.memoryHits++; saved.memoryTokens += Math.ceil(chars / 4); },
         onWorker: (model) => {
@@ -344,30 +351,35 @@ export default function (pi: ExtensionAPI) {
       const pool = await withCatalogFallback(rawPool);
 
       let { complexity, estTokens } = heuristicComplexity({ question: params.question, files });
-      // A worker can be priced/capable on paper yet unusable in practice (e.g. a
-      // provider-account restriction unrelated to pricing, like Codex-via-ChatGPT
-      // rejecting a specific model id). Track those here and retry with the
-      // next-best candidate instead of failing the whole call.
-      const brokenWorkers = new Set<string>();
-      const available = () => pool.filter((m) => !brokenWorkers.has(`${m.provider}/${m.id}`));
+      const options = { estTokens, complexity, primaryCost: ctx.model?.cost, timings, cooldown };
+      const tiers = workerTiers(pool, options);
+      if (!tiers.length) throw new Error(`No configured worker fits this request (${explainPickFailure(pool, options)}). Run /modelwise setup.`);
 
-      let model, response;
+      // A worker can be priced/capable on paper yet unusable in practice (rate
+      // limits, provider-account restrictions, empty output). Hand the request
+      // to a same-price sibling first, then to the next price tier.
       const started = Date.now();
-      for (;;) {
-        model = pickWorker(available(), { estTokens, complexity, primaryCost: ctx.model?.cost, timings });
-        if (!model) throw new Error(`No configured worker fits this request (${explainPickFailure(available(), { estTokens, complexity, primaryCost: ctx.model?.cost })}). Run /modelwise setup.`);
-        if (signal?.aborted) throw new Error("Cancelled.");
-
-        response = await ctx.modelRegistry.complete(model, { systemPrompt: SYSTEM, messages: [{ role: "user", content: [{ type: "text", text: workerPrompt(params.question, files) }], timestamp: Date.now() }] }, { signal });
-        if (response.stopReason === "aborted") { stats.failures += 1; throw new Error("Worker cancelled."); }
-        if (response.stopReason === "error") {
-          brokenWorkers.add(`${model.provider}/${model.id}`);
-          continue;
-        }
-        break;
+      let result;
+      try {
+        result = await cascade(tiers, async (model) => {
+          const response = await ctx.modelRegistry.complete(model, { systemPrompt: SYSTEM, messages: [{ role: "user", content: [{ type: "text", text: workerPrompt(params.question, files) }], timestamp: Date.now() }] }, { signal })
+            .catch((error) => { throw signal?.aborted ? new Error("Worker cancelled.") : requestFailure(error); });
+          if (signal?.aborted) throw new Error("Worker cancelled.");
+          const text = textFromResponse(response);
+          // A length-truncated answer with findings is still useful here.
+          const failure = response.stopReason === "error" || response.stopReason === "aborted" ? responseFailure(response)
+            : text ? null : new WorkerFailure("returned no findings");
+          if (!failure) return { model, response, text };
+          // Failed attempts can still be billed; the successful one is counted below.
+          const cost = response.usage?.cost?.total;
+          if (typeof cost === "number" && cost >= 0) stats.totalCostUsd += cost;
+          throw failure;
+        }, { signal, cooldown });
+      } catch (error) {
+        stats.failures += 1;
+        throw error;
       }
-      const text = textFromResponse(response);
-      if (!text) { stats.failures += 1; throw new Error("Worker returned no findings."); }
+      const { model, response, text } = result;
 
       const workerKey = `${model.provider}/${model.id}`;
       const costUsd = response.usage?.cost?.total ?? null;

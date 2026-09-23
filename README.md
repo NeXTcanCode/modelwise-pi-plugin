@@ -37,7 +37,7 @@ You need an eligible worker model cheaper than your selected primary. Modelwise 
 
 Select your primary model and submit a repository task normally. Modelwise prepares a bounded investigation and supplies its findings to the primary automatically. You do not need to select files or invoke a worker yourself.
 
-Your primary remains responsible for the final work. If delegation is unavailable or fails, the primary continues normally. Image-containing prompts currently bypass automatic investigation.
+Your primary remains responsible for the final work. Workers are grouped into price tiers, cheapest first. If a worker fails (rate limit, provider error, token limit, unusable output), the task, plus any incomplete draft, goes to a same-price sibling, then to the next tier. Up to 6 attempts are made. Only when all of them fail does the primary do the work itself. A worker that hit a provider error is skipped for 5 minutes. Image-containing prompts currently bypass automatic investigation.
 
 | Command                         | Purpose                                            |
 | ------------------------------- | -------------------------------------------------- |

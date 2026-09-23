@@ -33,4 +33,6 @@ export function investigate(options: {
     save(): Promise<void>;
   } | null;
   onMemoryHit?: (path: string, chars: number) => void;
+  /** Session-wide `provider/id` → expiry ms for workers that recently hit provider failures. */
+  cooldown?: Record<string, number>;
 }): Promise<InvestigationResult>;
